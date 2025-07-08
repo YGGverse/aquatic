@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::iter::repeat_with;
 use std::net::IpAddr;
 use std::ops::DerefMut;
@@ -133,6 +134,95 @@ impl TorrentMaps {
                     ::log::error!("couldn't send statistics message: {:#}", err);
                 }
             }
+
+            if config.statistics.write_json_to_file {
+                use anyhow::{Context, Result};
+                fn save_to_file(
+                    path: &std::path::PathBuf,
+                    info_hashes: &Vec<InfoHash>,
+                ) -> Result<()> {
+                    let mut f = Context::with_context(std::fs::File::create(path), || {
+                        format!("File path: {}", path.to_string_lossy())
+                    })?;
+                    write!(f, "[")?;
+                    if !info_hashes.is_empty() {
+                        write!(f, "\"{}\"", info_hashes[0])?;
+                        if let Some(i) = info_hashes.get(1..) {
+                            for info_hash in i {
+                                write!(f, ",\"{info_hash}\"")?;
+                            }
+                        }
+                    }
+                    write!(f, "]")?;
+                    Ok(())
+                }
+                if config.network.ipv4_active() {
+                    if let Err(err) =
+                        save_to_file(&config.statistics.json_info_hash_ipv4_file_path, &ipv4.3)
+                    {
+                        ::log::error!("Couldn't dump IPv4 info-hash table to file: {:#}", err)
+                    }
+                }
+                if config.network.ipv6_active() {
+                    if let Err(err) =
+                        save_to_file(&config.statistics.json_info_hash_ipv6_file_path, &ipv6.3)
+                    {
+                        ::log::error!("Couldn't dump IPv6 info-hash table to file: {:#}", err)
+                    }
+                }
+            }
+
+            if config.statistics.write_bin_to_file {
+                use anyhow::{Context, Result};
+                use std::{fs::File, io::Read, path::PathBuf};
+                /// Prevent extra write operations by compare the file content is up to date
+                fn is_same(path: &PathBuf, info_hashes: &Vec<InfoHash>) -> Result<bool> {
+                    if !std::fs::exists(path)? {
+                        return Ok(false);
+                    }
+                    const L: usize = 20; // v1 only
+                    let mut t = 0;
+                    let mut f = File::open(path)?;
+                    loop {
+                        let mut b = [0; L];
+                        if f.read(&mut b)? != L {
+                            break;
+                        }
+                        if !info_hashes.iter().any(|i| i.0 == b) {
+                            return Ok(false);
+                        }
+                        t += 1
+                    }
+                    Ok(t == info_hashes.len())
+                }
+                /// Dump `InfoHash` index to file
+                fn save_to_file(path: &PathBuf, info_hashes: &Vec<InfoHash>) -> Result<()> {
+                    if is_same(path, info_hashes)? {
+                        return Ok(());
+                    }
+                    let mut f = Context::with_context(File::create(path), || {
+                        format!("File path: {}", path.to_string_lossy())
+                    })?;
+                    for i in info_hashes {
+                        f.write_all(&i.0)?
+                    }
+                    Ok(())
+                }
+                if config.network.ipv4_active() {
+                    if let Err(err) =
+                        save_to_file(&config.statistics.bin_info_hash_ipv4_file_path, &ipv4.3)
+                    {
+                        ::log::error!("Couldn't dump IPv4 info-hash table to file: {:#}", err)
+                    }
+                }
+                if config.network.ipv6_active() {
+                    if let Err(err) =
+                        save_to_file(&config.statistics.bin_info_hash_ipv6_file_path, &ipv6.3)
+                    {
+                        ::log::error!("Couldn't dump IPv6 info-hash table to file: {:#}", err)
+                    }
+                }
+            }
         }
     }
 }
@@ -219,9 +309,10 @@ impl<I: Ip> TorrentMapShards<I> {
         access_list_cache: &mut AccessListCache,
         access_list_mode: AccessListMode,
         now: SecondsSinceServerStart,
-    ) -> (usize, usize, Option<Histogram<u64>>) {
+    ) -> (usize, usize, Option<Histogram<u64>>, Vec<InfoHash>) {
         let mut total_num_torrents = 0;
         let mut total_num_peers = 0;
+        let mut info_hashes: Vec<InfoHash> = Vec::new();
 
         let mut opt_histogram: Option<Histogram<u64>> = config
             .statistics
@@ -297,9 +388,21 @@ impl<I: Ip> TorrentMapShards<I> {
             torrent_map_shard.shrink_to_fit();
 
             total_num_torrents += torrent_map_shard.len();
+
+            if config.statistics.collect_info_hash() {
+                info_hashes.reserve(total_num_torrents);
+                for (k, _) in torrent_map_shard.iter() {
+                    info_hashes.push(*k)
+                }
+            }
         }
 
-        (total_num_torrents, total_num_peers, opt_histogram)
+        (
+            total_num_torrents,
+            total_num_peers,
+            opt_histogram,
+            info_hashes,
+        )
     }
 
     fn get_shard(&self, info_hash: &InfoHash) -> &RwLock<TorrentMapShard<I>> {
